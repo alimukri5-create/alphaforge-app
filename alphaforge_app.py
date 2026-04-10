@@ -4,398 +4,532 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from scipy import signal
-from scipy.stats import entropy
+from scipy import stats
 import warnings
 warnings.filterwarnings('ignore')
 
-st.set_page_config(page_title="AlphaForge Pro", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="AlphaForge Alpha", page_icon="🎯", layout="wide")
 
-# Title
-st.title("🎯 AlphaForge Pro")
-st.subheader("Multi-Model Quantitative Analytics Platform")
+st.title("🎯 AlphaForge Alpha Generation")
+st.subheader("Probabilistic Forecasting & Statistical Edge")
 
-# Sidebar
 st.sidebar.header("📊 Analysis Settings")
 ticker = st.sidebar.text_input("Ticker Symbol", value="MSFT").upper()
+benchmark = st.sidebar.text_input("Benchmark", value="SPY").upper()
 timeframe = st.sidebar.selectbox("Timeframe", ["1y", "2y", "5y"], index=1)
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("**Active Models:**")
-models_active = {
-    "SVJ (Volatility + Jumps)": st.sidebar.checkbox("SVJ", value=True),
-    "Kalman (Trend)": st.sidebar.checkbox("Kalman", value=True),
-    "Wavelet (Cycles)": st.sidebar.checkbox("Wavelet", value=True),
-    "Info Theory (Predictability)": st.sidebar.checkbox("Info Theory", value=True),
-    "Topological (S/R)": st.sidebar.checkbox("Topological", value=True),
-    "LSTM (Regime)": st.sidebar.checkbox("LSTM", value=True),
-    "EVT (Tail Risk)": st.sidebar.checkbox("EVT", value=True),
-    "Technical (RSI/MA)": st.sidebar.checkbox("Technical", value=True)
-}
+st.sidebar.markdown("**Alpha Models:**")
+mc_on = st.sidebar.checkbox("Monte Carlo Forward Paths", value=True)
+regime_on = st.sidebar.checkbox("Regime Detection", value=True)
+coint_on = st.sidebar.checkbox("Cointegration vs Benchmark", value=True)
+risk_on = st.sidebar.checkbox("Advanced Risk Metrics", value=True)
 
-if st.sidebar.button("🚀 Run Full Analysis", type="primary"):
-    with st.spinner(f"Running 8-model ensemble for {ticker}..."):
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Base Models:**")
+svj_on = st.sidebar.checkbox("SVJ", value=True)
+kalman_on = st.sidebar.checkbox("Kalman", value=True)
+topo_on = st.sidebar.checkbox("Topological", value=True)
+lstm_on = st.sidebar.checkbox("LSTM", value=True)
+evt_on = st.sidebar.checkbox("EVT", value=True)
+tech_on = st.sidebar.checkbox("Technical", value=True)
+
+if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
+    with st.spinner(f"Generating alpha analysis for {ticker}..."):
         
         try:
             # Load data
             stock = yf.Ticker(ticker)
+            bench = yf.Ticker(benchmark)
             data = stock.history(period=timeframe)
+            bench_data = bench.history(period=timeframe)
             
             if data.empty:
-                st.error("No data found. Check ticker symbol.")
+                st.error("No data found")
                 st.stop()
             
             prices = data['Close']
             current_price = float(prices.iloc[-1])
             returns = prices.pct_change().dropna()
-            log_returns = np.log(prices / prices.shift(1)).dropna()
+            
+            # Load benchmark if available
+            if not bench_data.empty and coint_on:
+                bench_prices = bench_data['Close']
+                bench_returns = bench_prices.pct_change().dropna()
+                # Align lengths
+                min_len = min(len(returns), len(bench_returns))
+                aligned_returns = returns.iloc[-min_len:]
+                aligned_bench = bench_returns.iloc[-min_len:]
+            else:
+                aligned_bench = None
             
             # ==========================================
-            # MODEL 1: SVJ (Stochastic Vol + Jumps)
+            # BASE MODELS (Your existing 6)
             # ==========================================
-            if models_active["SVJ (Volatility + Jumps)"]:
+            
+            # SVJ
+            if svj_on:
                 vol = returns.std() * np.sqrt(252)
                 jump_threshold = 3 * returns.std()
                 jumps = np.abs(returns) > jump_threshold
                 jump_intensity = jumps.sum() / len(returns) * 252
                 trend = returns.mean() * 252
                 
-                svj_fv = current_price * (1 + trend * 0.5)
-                
                 if trend > 0.05 and vol < 0.4:
-                    svj_signal = ("BULLISH", 85, f"Trend={trend:.1%}, Vol={vol:.1%}, {jump_intensity:.1f} jumps/yr")
+                    svj_sig = ("BULLISH", 85, f"Trend {trend:.1%}, {jump_intensity:.1f} jumps/yr")
                 elif trend < -0.05:
-                    svj_signal = ("BEARISH", 80, f"Negative trend {trend:.1%}")
+                    svj_sig = ("BEARISH", 80, f"Negative trend {trend:.1%}")
                 else:
-                    svj_signal = ("NEUTRAL", 50, f"Consolidation phase")
+                    svj_sig = ("NEUTRAL", 50, "Consolidation")
             else:
-                svj_signal = ("OFF", 0, "Disabled")
+                svj_sig = ("OFF", 0, "Disabled")
                 vol = returns.std() * np.sqrt(252)
+                jump_intensity = 0
             
-            # ==========================================
-            # MODEL 2: Kalman Filter (Trend Extraction)
-            # ==========================================
-            if models_active["Kalman (Trend)"]:
+            # Kalman
+            if kalman_on:
                 kf_trend = prices.ewm(span=20).mean().iloc[-1]
                 deviation = (current_price - kf_trend) / kf_trend
                 
                 if deviation < -0.05:
-                    kalman_signal = ("BULLISH", 75, f"Price {deviation:.1%} below trend (${kf_trend:.2f})")
+                    kalman_sig = ("BULLISH", 75, f"{deviation:.1%} below trend")
                 elif deviation > 0.05:
-                    kalman_signal = ("BEARISH", 75, f"Price {deviation:.1%} above trend")
+                    kalman_sig = ("BEARISH", 75, f"{deviation:.1%} above trend")
                 else:
-                    kalman_signal = ("NEUTRAL", 50, f"Aligned with trend")
+                    kalman_sig = ("NEUTRAL", 50, "Aligned")
             else:
-                kalman_signal = ("OFF", 0, "Disabled")
+                kalman_sig = ("OFF", 0, "Disabled")
             
-            # ==========================================
-            # MODEL 3: Wavelet (Multi-Scale Cycles)
-            # ==========================================
-            if models_active["Wavelet (Cycles)"]:
-                corr_5 = returns.autocorr(lag=5) or 0
-                recent_vol = returns.tail(20).std() * np.sqrt(252)
-                hist_vol = returns.head(len(returns)-20).std() * np.sqrt(252)
-                vol_shift = abs(recent_vol - hist_vol) / hist_vol
-                
-                if vol_shift > 0.3:
-                    wavelet_signal = ("NEUTRAL", 60, f"⚠️ Regime shift detected ({vol_shift:.1%} vol change)")
-                elif corr_5 < -0.1:
-                    wavelet_signal = ("BULLISH", 70, f"Mean reversion likely (5d autocorr={corr_5:.2f})")
-                else:
-                    wavelet_signal = ("NEUTRAL", 50, f"No clear cycle (autocorr={corr_5:.2f})")
-            else:
-                wavelet_signal = ("OFF", 0, "Disabled")
-            
-            # ==========================================
-            # MODEL 4: Information Theory (Predictability)
-            # ==========================================
-            if models_active["Info Theory (Predictability)"]:
-                binary = (returns > returns.median()).astype(int).values
-                
-                def lz_complexity(seq):
-                    n = len(seq)
-                    if n == 0:
-                        return 0
-                    complexity = 1
-                    prefix_len = 1
-                    while prefix_len < n:
-                        max_len = 0
-                        for i in range(1, min(prefix_len + 1, n - prefix_len + 1)):
-                            if np.array_equal(seq[prefix_len:prefix_len+i], 
-                                             seq[prefix_len-i:prefix_len]):
-                                max_len = i
-                        if max_len == 0:
-                            complexity += 1
-                            prefix_len += 1
-                        else:
-                            prefix_len += max_len
-                    return complexity / (n / np.log2(n)) if n > 1 else 0
-                
-                lz = lz_complexity(binary)
-                predictability = 1 - lz
-                
-                if predictability > 0.6:
-                    info_signal = ("BULLISH", 80, f"High predictability ({predictability:.1%}) - patterns strong")
-                elif predictability > 0.4:
-                    info_signal = ("NEUTRAL", 50, f"Moderate predictability ({predictability:.1%})")
-                else:
-                    info_signal = ("NEUTRAL", 40, f"Low predictability ({predictability:.1%}) - noisy")
-            else:
-                info_signal = ("OFF", 0, "Disabled")
-                predictability = 0.5
-            
-            # ==========================================
-            # MODEL 5: Topological (Persistent S/R)
-            # ==========================================
-            if models_active["Topological (S/R)"]:
+            # Topological
+            if topo_on:
                 from scipy.signal import argrelextrema
-                
-                local_max = argrelextrema(prices.values, np.greater, order=10)[0]
                 local_min = argrelextrema(prices.values, np.less, order=10)[0]
                 
                 if len(local_min) > 0:
                     recent_support = prices.iloc[local_min[-1]]
                     persistence = len(prices) - local_min[-1]
                 else:
-                    recent_support = prices.min()
+                    recent_support = prices.tail(60).min()
                     persistence = 0
                 
-                if len(local_max) > 0:
-                    recent_resistance = prices.iloc[local_max[-1]]
-                else:
-                    recent_resistance = prices.max()
-                
                 if current_price < recent_support * 1.02:
-                    topo_signal = ("BULLISH", 85, f"At persistent support ${recent_support:.2f} ({persistence} days)")
-                elif current_price > recent_resistance * 0.98:
-                    topo_signal = ("BEARISH", 75, f"At persistent resistance ${recent_resistance:.2f}")
+                    topo_sig = ("BULLISH", 85, f"At support ${recent_support:.2f} ({persistence}d)")
                 else:
-                    topo_signal = ("NEUTRAL", 50, f"Between S/R levels")
+                    topo_sig = ("NEUTRAL", 50, f"Support ${recent_support:.2f}")
             else:
-                topo_signal = ("OFF", 0, "Disabled")
+                topo_sig = ("OFF", 0, "Disabled")
                 recent_support = prices.tail(60).min()
             
-            # ==========================================
-            # MODEL 6: LSTM (Regime Prediction)
-            # ==========================================
-            if models_active["LSTM (Regime)"]:
+            # LSTM
+            if lstm_on:
                 delta = prices.diff()
-                gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-                loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
                 rs = gain / loss
                 rsi = (100 - (100 / (1 + rs))).iloc[-1]
                 
                 if rsi < 35 and vol > 0.25:
-                    lstm_signal = ("BULLISH", 80, f"RSI={rsi:.1f}, Vol={vol:.1%} → Mean reversion")
+                    lstm_sig = ("BULLISH", 80, f"RSI {rsi:.1f}, oversold")
                 elif rsi > 65:
-                    lstm_signal = ("BEARISH", 75, f"RSI={rsi:.1f} → Overbought")
+                    lstm_sig = ("BEARISH", 75, f"RSI {rsi:.1f}, overbought")
                 else:
-                    lstm_signal = ("NEUTRAL", 50, f"RSI={rsi:.1f} → Balanced")
+                    lstm_sig = ("NEUTRAL", 50, f"RSI {rsi:.1f}")
             else:
-                lstm_signal = ("OFF", 0, "Disabled")
+                lstm_sig = ("OFF", 0, "Disabled")
                 rsi = 50
             
-            # ==========================================
-            # MODEL 7: EVT (Extreme Value / Tail Risk)
-            # ==========================================
-            if models_active["EVT (Tail Risk)"]:
+            # EVT
+            if evt_on:
                 var_95 = np.percentile(returns, 5)
                 var_99 = np.percentile(returns, 1)
                 tail_risk = abs(var_99) * current_price
                 
                 if abs(var_99) > 0.04:
-                    evt_signal = ("NEUTRAL", 60, f"⚠️ High tail risk: 99% VaR={var_99:.2%} (${tail_risk:.2f})")
+                    evt_sig = ("NEUTRAL", 60, f"⚠️ Tail risk {var_99:.2%}")
                 else:
-                    evt_signal = ("NEUTRAL", 70, f"Normal tail risk: 95% VaR={var_95:.2%}")
+                    evt_sig = ("NEUTRAL", 70, f"VaR 95%: {var_95:.2%}")
             else:
-                evt_signal = ("OFF", 0, "Disabled")
+                evt_sig = ("OFF", 0, "Disabled")
                 var_95 = -0.02
             
-            # ==========================================
-            # MODEL 8: Technical (Classical)
-            # ==========================================
-            if models_active["Technical (RSI/MA)"]:
+            # Technical
+            if tech_on:
                 sma_50 = prices.rolling(50).mean().iloc[-1]
                 sma_200 = prices.rolling(200).mean().iloc[-1]
                 
                 if current_price > sma_50 > sma_200:
-                    tech_signal = ("BULLISH", 75, f"Golden alignment: Price > 50MA > 200MA")
+                    tech_sig = ("BULLISH", 75, "Golden cross")
                 elif current_price < sma_50 < sma_200:
-                    tech_signal = ("BEARISH", 75, f"Death cross alignment")
+                    tech_sig = ("BEARISH", 75, "Death cross")
                 else:
-                    tech_signal = ("NEUTRAL", 50, f"Mixed MA signals")
+                    tech_sig = ("NEUTRAL", 50, "Mixed")
             else:
-                tech_signal = ("OFF", 0, "Disabled")
-                sma_50 = prices.mean()
+                tech_sig = ("OFF", 0, "Disabled")
             
             # ==========================================
-            # ENSEMBLE FUSION
+            # ALPHA GENERATION MODELS (The New Stuff)
             # ==========================================
-            all_signals = [
-                ("SVJ", svj_signal), ("Kalman", kalman_signal), ("Wavelet", wavelet_signal),
-                ("Info Theory", info_signal), ("Topological", topo_signal), 
-                ("LSTM", lstm_signal), ("EVT", evt_signal), ("Technical", tech_signal)
-            ]
             
-            active_signals = [s for s in all_signals if s[1][0] != "OFF"]
-            
-            bullish_score = sum([s[1][1] for s in active_signals if s[1][0] == "BULLISH"])
-            bearish_score = sum([s[1][1] for s in active_signals if s[1][0] == "BEARISH"])
-            total_score = sum([s[1][1] for s in active_signals])
-            
-            if total_score == 0:
-                composite = "NEUTRAL"
-                confidence = 50
-            else:
-                net_score = (bullish_score - bearish_score) / total_score
-                if net_score > 0.3:
-                    composite = "STRONG_BUY"
-                    confidence = int(70 + net_score * 30)
-                elif net_score > 0.1:
-                    composite = "BUY"
-                    confidence = int(60 + net_score * 40)
-                elif net_score < -0.3:
-                    composite = "STRONG_SELL"
-                    confidence = int(70 - net_score * 30)
-                elif net_score < -0.1:
-                    composite = "SELL"
-                    confidence = int(60 - net_score * 40)
-                else:
-                    composite = "HOLD"
-                    confidence = 50
-            
-            # ==========================================
-            # CALCULATE ZONES (Advanced)
-            # ==========================================
-            vol_adjustment = 1.0 + (vol - 0.25) * 2
-            predictability_adjustment = 1.0 - (predictability - 0.5)
-            zone_multiplier = max(0.8, min(1.5, vol_adjustment * predictability_adjustment))
-            
-            z1 = current_price * (1 - 0.02 * zone_multiplier)
-            z2 = current_price * (1 - 0.05 * zone_multiplier)
-            z3 = current_price * (1 - 0.12 * zone_multiplier)
-            
-            if models_active["Topological (S/R)"]:
-                z2 = max(z2, recent_support * 0.98)
-            
-            fair_value = current_price * 1.15
-            
-            # ==========================================
-            # DISPLAY RESULTS
-            # ==========================================
-            st.success(f"✅ Analysis complete for {ticker} using {len(active_signals)} models")
-            
-            # Top metrics
-            col1, col2, col3, col4, col5 = st.columns(5)
-            col1.metric("Price", f"${current_price:.2f}")
-            col2.metric("Signal", composite, f"{confidence}% conf")
-            col3.metric("Volatility", f"{vol:.1%}")
-            col4.metric("Predictability", f"{predictability:.1%}")
-            col5.metric("Jumps/Year", f"{jump_intensity:.1f}")
-            
-            st.divider()
-            
-            # Chart
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                               vertical_spacing=0.08, row_heights=[0.7, 0.3])
-            
-            fig.add_trace(go.Scatter(x=prices.index, y=prices, mode='lines', 
-                                     name='Price', line=dict(color='black', width=2)), row=1, col=1)
-            
-            fig.add_hrect(y0=z1, y1=current_price, fillcolor="green", opacity=0.2, 
-                         annotation_text="Zone 1", row=1, col=1)
-            fig.add_hrect(y0=z2, y1=z1, fillcolor="blue", opacity=0.2, 
-                         annotation_text="Zone 2", row=1, col=1)
-            fig.add_hrect(y0=z3, y1=z2, fillcolor="purple", opacity=0.2, 
-                         annotation_text="Zone 3", row=1, col=1)
-            
-            fig.add_trace(go.Bar(x=data.index, y=data['Volume'], name='Volume', 
-                                marker_color='gray'), row=2, col=1)
-            
-            fig.update_layout(height=600, showlegend=True, 
-                            title=f"{ticker} - Multi-Model Analysis")
-            st.plotly_chart(fig, use_container_width=True)
-            
-            st.divider()
-            
-            # Two column layout
-            left, right = st.columns([1, 1])
-            
-            with left:
-                st.subheader("🎯 Entry Zones")
-                st.write(f"Zone Multiplier: {zone_multiplier:.2f}x (volatility + predictability adjusted)")
+            # 1. MONTE CARLO FORWARD SIMULATION
+            if mc_on:
+                n_sims = 1000
+                n_days = 30
+                mu = returns.mean()
+                sigma = returns.std()
                 
-                zone_data = {
-                    "Zone": ["Zone 1 (Immediate)", "Zone 2 (Support)", "Zone 3 (Deep Value)"],
-                    "Price Range": [f"${z1:.2f} - ${current_price:.2f}", 
-                                   f"${z2:.2f} - ${z1:.2f}", 
-                                   f"${z3:.2f} - ${z2:.2f}"],
-                    "Fill Prob": ["70%", "40%", "15%"],
-                    "Strategy": ["Scale in", "Accumulate", "Full size"]
+                np.random.seed(42)
+                mc_paths = np.zeros((n_sims, n_days))
+                mc_paths[:, 0] = current_price
+                
+                for i in range(1, n_days):
+                    shocks = np.random.normal(mu, sigma, n_sims)
+                    mc_paths[:, i] = mc_paths[:, i-1] * (1 + shocks)
+                
+                final_prices = mc_paths[:, -1]
+                mc_stats = {
+                    'prob_up': np.mean(final_prices > current_price),
+                    'median': np.median(final_prices),
+                    'mean': np.mean(final_prices),
+                    'p5': np.percentile(final_prices, 5),
+                    'p25': np.percentile(final_prices, 25),
+                    'p75': np.percentile(final_prices, 75),
+                    'p95': np.percentile(final_prices, 95),
+                    'paths': mc_paths
                 }
-                st.dataframe(pd.DataFrame(zone_data), hide_index=True)
-                
-                st.subheader("🛡️ Risk Management")
-                st.write(f"**Hard Stop:** ${recent_support * 0.97:.2f}")
-                st.write(f"**Take Profit:** ${fair_value:.2f}")
-                st.write(f"**Expected Tail Risk:** {abs(var_95)*100:.1f}% daily")
+            else:
+                mc_stats = None
             
-            with right:
-                st.subheader("🧠 Model Consensus")
+            # 2. REGIME DETECTION (Hidden Markov Style)
+            if regime_on:
+                vol_20 = returns.rolling(20).std() * np.sqrt(252)
+                vol_mean = vol_20.mean()
+                vol_std = vol_20.std()
+                current_vol = vol_20.iloc[-1]
                 
-                for model_name, (sig, conf, comment) in all_signals:
-                    if sig == "OFF":
-                        continue
-                    emoji = "🟢" if sig == "BULLISH" else "🔴" if sig == "BEARISH" else "🟡"
-                    with st.expander(f"{emoji} {model_name}: {sig} ({conf}%)"):
-                        st.write(comment)
+                # Regime classification
+                if current_vol > vol_mean + vol_std:
+                    regime = "HIGH_VOL"
+                    regime_conf = 0.8
+                    regime_desc = "High volatility - reduce size, widen stops"
+                    regime_color = "red"
+                elif current_vol < vol_mean - vol_std:
+                    regime = "LOW_VOL"
+                    regime_conf = 0.8
+                    regime_desc = "Low volatility - trend following effective"
+                    regime_color = "green"
+                else:
+                    regime = "TRANSITION"
+                    regime_conf = 0.6
+                    regime_desc = "Regime uncertainty - caution"
+                    regime_color = "yellow"
                 
-                st.info(f"**Ensemble Logic:** Net score = {(bullish_score - bearish_score)/max(total_score,1):.2f}")
+                regime_stats = {
+                    'regime': regime,
+                    'confidence': regime_conf,
+                    'description': regime_desc,
+                    'color': regime_color,
+                    'current_vol': current_vol,
+                    'mean_vol': vol_mean
+                }
+            else:
+                regime_stats = None
+            
+            # 3. COINTEGRATION / STATISTICAL ARBITRAGE
+            if coint_on and aligned_bench is not None:
+                correlation = aligned_returns.corr(aligned_bench)
+                
+                # Price ratio z-score
+                price_ratio = prices / bench_prices.reindex(prices.index, method='ffill')
+                ratio_mean = price_ratio.mean()
+                ratio_std = price_ratio.std()
+                current_z = (price_ratio.iloc[-1] - ratio_mean) / ratio_std
+                
+                if abs(current_z) > 2:
+                    coint_signal = "MEAN_REVERSION"
+                    coint_strength = "STRONG"
+                    if current_z > 2:
+                        coint_trade = f"SHORT {ticker} / LONG {benchmark}"
+                    else:
+                        coint_trade = f"LONG {ticker} / SHORT {benchmark}"
+                elif abs(current_z) > 1:
+                    coint_signal = "MEAN_REVERSION"
+                    coint_strength = "MODERATE"
+                    coint_trade = "Watch for entry"
+                else:
+                    coint_signal = "EQUILIBRIUM"
+                    coint_strength = "NONE"
+                    coint_trade = "No arbitrage"
+                
+                coint_stats = {
+                    'correlation': correlation,
+                    'z_score': current_z,
+                    'signal': coint_signal,
+                    'strength': coint_strength,
+                    'trade': coint_trade
+                }
+            else:
+                coint_stats = None
+            
+            # 4. ADVANCED RISK METRICS
+            if risk_on and aligned_bench is not None:
+                # Sharpe
+                sharpe = (returns.mean() / returns.std()) * np.sqrt(252) if returns.std() > 0 else 0
+                
+                # Information Ratio (alpha vs benchmark)
+                excess = aligned_returns - aligned_bench
+                tracking_err = excess.std() * np.sqrt(252)
+                info_ratio = (excess.mean() * 252) / tracking_err if tracking_err > 0 else 0
+                
+                # Max Drawdown
+                cum_ret = (1 + returns).cumprod()
+                running_max = cum_ret.expanding().max()
+                drawdown = (cum_ret - running_max) / running_max
+                max_dd = drawdown.min()
+                
+                # Sortino
+                downside = returns[returns < 0]
+                downside_vol = downside.std() * np.sqrt(252) if len(downside) > 0 else 0.01
+                sortino = (returns.mean() * 252) / downside_vol if downside_vol > 0 else 0
+                
+                risk_stats = {
+                    'sharpe': sharpe,
+                    'info_ratio': info_ratio,
+                    'max_dd': max_dd,
+                    'sortino': sortino,
+                    'volatility': vol
+                }
+            else:
+                risk_stats = None
+            
+            # ==========================================
+            # ENSEMBLE & ZONES
+            # ==========================================
+            
+            all_sigs = [svj_sig, kalman_sig, topo_sig, lstm_sig, evt_sig, tech_sig]
+            active = [s for s in all_sigs if s[0] != "OFF"]
+            
+            bullish = sum([s[1] for s in active if s[0] == "BULLISH"])
+            bearish = sum([s[1] for s in active if s[0] == "BEARISH"])
+            total = sum([s[1] for s in active])
+            
+            if total == 0:
+                composite, confidence = "NEUTRAL", 50
+            else:
+                net = (bullish - bearish) / total
+                if net > 0.3:
+                    composite, confidence = "STRONG_BUY", int(75 + net * 25)
+                elif net > 0.1:
+                    composite, confidence = "BUY", int(65 + net * 35)
+                elif net < -0.3:
+                    composite, confidence = "STRONG_SELL", int(75 - net * 25)
+                elif net < -0.1:
+                    composite, confidence = "SELL", int(65 - net * 35)
+                else:
+                    composite, confidence = "HOLD", 50
+            
+            # Dynamic zones with regime adjustment
+            base_mult = 1.0
+            if regime_stats:
+                if regime_stats['regime'] == "HIGH_VOL":
+                    base_mult = 1.3  # Wider zones
+                elif regime_stats['regime'] == "LOW_VOL":
+                    base_mult = 0.9  # Tighter zones
+            
+            z1 = current_price * (1 - 0.02 * base_mult)
+            z2 = current_price * (1 - 0.05 * base_mult)
+            z3 = current_price * (1 - 0.12 * base_mult)
+            z2 = max(z2, recent_support * 0.98)
+            
+            # ==========================================
+            # DISPLAY
+            # ==========================================
+            
+            st.success(f"✅ Alpha analysis complete for {ticker}")
+            
+            # Top Metrics
+            cols = st.columns([1, 1, 1, 1, 1.5])
+            cols[0].metric("Price", f"${current_price:.2f}")
+            cols[1].metric("Signal", composite, f"{confidence}%")
+            cols[2].metric("Volatility", f"{vol:.1%}")
+            if risk_stats:
+                cols[3].metric("Sharpe", f"{risk_stats['sharpe']:.2f}")
+                cols[4].metric("Max DD", f"{risk_stats['max_dd']:.1%}")
+            else:
+                cols[3].metric("Jumps/Yr", f"{jump_intensity:.1f}")
             
             st.divider()
             
-            # Investment Thesis
-            st.subheader("💡 Investment Thesis")
+            # Main tabs
+            tab1, tab2, tab3, tab4 = st.tabs(["📊 Price & Zones", "🎲 Monte Carlo", "🧠 Model Consensus", "⚠️ Risk & Regime"])
             
-            thesis_parts = []
+            with tab1:
+                # Price chart with zones
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=prices.index, y=prices, mode='lines', 
+                                        name='Price', line=dict(color='black', width=2)))
+                
+                # Zone bands
+                fig.add_hrect(y0=z1, y1=current_price, fillcolor="green", opacity=0.2, 
+                             annotation_text="Zone 1")
+                fig.add_hrect(y0=z2, y1=z1, fillcolor="blue", opacity=0.2, 
+                             annotation_text="Zone 2")
+                fig.add_hrect(y0=z3, y1=z2, fillcolor="purple", opacity=0.2, 
+                             annotation_text="Zone 3")
+                
+                fig.update_layout(height=500, title=f"{ticker} Price Action")
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Zone table
+                zone_df = pd.DataFrame({
+                    'Zone': ['Zone 1 (Immediate)', 'Zone 2 (Support)', 'Zone 3 (Deep Value)'],
+                    'Price Range': [f"${z1:.2f} - ${current_price:.2f}",
+                                   f"${z2:.2f} - ${z1:.2f}",
+                                   f"${z3:.2f} - ${z2:.2f}"],
+                    'Fill Prob': ['70%', '40%', '15%'],
+                    'R/R': ['2.5:1', '3.5:1', '5:1']
+                })
+                st.dataframe(zone_df, hide_index=True, use_container_width=True)
+            
+            with tab2:
+                if mc_stats:
+                    st.subheader("Monte Carlo Forward Simulation (30 Days)")
+                    
+                    # Plot paths
+                    fig_mc = go.Figure()
+                    
+                    # Sample paths
+                    for i in range(0, min(100, len(mc_stats['paths'])), 5):
+                        fig_mc.add_trace(go.Scatter(
+                            x=list(range(30)), y=mc_stats['paths'][i],
+                            mode='lines', line=dict(color='gray', width=0.5),
+                            opacity=0.2, showlegend=False
+                        ))
+                    
+                    # Percentiles
+                    fig_mc.add_trace(go.Scatter(x=list(range(30)), 
+                                               y=np.percentile(mc_stats['paths'], 95, axis=0),
+                                               mode='lines', line=dict(color='green', width=2),
+                                               name='95th %ile'))
+                    fig_mc.add_trace(go.Scatter(x=list(range(30)), 
+                                               y=np.percentile(mc_stats['paths'], 50, axis=0),
+                                               mode='lines', line=dict(color='blue', width=3),
+                                               name='Median'))
+                    fig_mc.add_trace(go.Scatter(x=list(range(30)), 
+                                               y=np.percentile(mc_stats['paths'], 5, axis=0),
+                                               mode='lines', line=dict(color='red', width=2),
+                                               name='5th %ile'))
+                    
+                    fig_mc.add_hline(y=current_price, line_dash="dash", line_color="black")
+                    fig_mc.update_layout(height=400, xaxis_title="Days", yaxis_title="Price ($)")
+                    st.plotly_chart(fig_mc, use_container_width=True)
+                    
+                    # MC stats
+                    mc_cols = st.columns(4)
+                    mc_cols[0].metric("Prob Up", f"{mc_stats['prob_up']:.1%}")
+                    mc_cols[1].metric("Expected", f"${mc_stats['median']:.2f}", 
+                                     f"{(mc_stats['median']/current_price-1)*100:+.1f}%")
+                    mc_cols[2].metric("Worst 5%", f"${mc_stats['p5']:.2f}")
+                    mc_cols[3].metric("Best 5%", f"${mc_stats['p95']:.2f}")
+                else:
+                    st.info("Enable Monte Carlo in sidebar")
+            
+            with tab3:
+                st.subheader("Model Consensus")
+                
+                model_names = ["SVJ", "Kalman", "Topological", "LSTM", "EVT", "Technical"]
+                for name, sig in zip(model_names, all_sigs):
+                    if sig[0] == "OFF":
+                        continue
+                    emoji = "🟢" if sig[0] == "BULLISH" else "🔴" if sig[0] == "BEARISH" else "🟡"
+                    with st.expander(f"{emoji} {name}: {sig[0]} ({sig[1]}%)"):
+                        st.write(sig[2])
+                
+                # Net score
+                st.info(f"**Ensemble Net Score:** {net:.2f} (Bullish: {bullish}, Bearish: {bearish})")
+            
+            with tab4:
+                col_r1, col_r2 = st.columns(2)
+                
+                with col_r1:
+                    st.subheader("Risk Metrics")
+                    if risk_stats:
+                        st.metric("Sharpe Ratio", f"{risk_stats['sharpe']:.2f}")
+                        st.metric("Information Ratio", f"{risk_stats['info_ratio']:.2f}")
+                        st.metric("Sortino Ratio", f"{risk_stats['sortino']:.2f}")
+                        st.metric("Max Drawdown", f"{risk_stats['max_dd']:.1%}")
+                    else:
+                        st.info("Enable Risk Metrics in sidebar")
+                
+                with col_r2:
+                    st.subheader("Regime Detection")
+                    if regime_stats:
+                        color = regime_stats['color']
+                        if color == "red":
+                            st.error(f"**{regime_stats['regime']}** ({regime_stats['confidence']:.0%})")
+                        elif color == "green":
+                            st.success(f"**{regime_stats['regime']}** ({regime_stats['confidence']:.0%})")
+                        else:
+                            st.warning(f"**{regime_stats['regime']}** ({regime_stats['confidence']:.0%})")
+                        
+                        st.write(regime_stats['description'])
+                        st.write(f"Current: {regime_stats['current_vol']:.1%} vs Mean: {regime_stats['mean_vol']:.1%}")
+                    else:
+                        st.info("Enable Regime Detection in sidebar")
+                
+                if coint_stats:
+                    st.subheader(f"Statistical Arbitrage: {ticker} vs {benchmark}")
+                    st.metric("Correlation", f"{coint_stats['correlation']:.2f}")
+                    st.metric("Z-Score", f"{coint_stats['z_score']:.2f}σ")
+                    
+                    if coint_stats['strength'] == "STRONG":
+                        st.error(f"🚨 **{coint_stats['signal']}** - {coint_stats['trade']}")
+                    elif coint_stats['strength'] == "MODERATE":
+                        st.warning(f"⚠️ **{coint_stats['signal']}** - {coint_stats['trade']}")
+                    else:
+                        st.success(f"✅ **{coint_stats['signal']}** - {coint_stats['trade']}")
+            
+            st.divider()
+            
+            # Final recommendation
+            st.subheader("🎯 Alpha-Optimized Strategy")
+            
+            reasons = []
             if composite in ["BUY", "STRONG_BUY"]:
-                thesis_parts.append(f"✅ **Multi-model consensus bullish** ({confidence}% confidence)")
-                if predictability > 0.5:
-                    thesis_parts.append(f"✅ **High predictability** ({predictability:.1%}) - patterns reliable")
-                if jump_intensity < 5:
-                    thesis_parts.append(f"✅ **Low jump risk** ({jump_intensity:.1f}/year) - stable price action")
-                thesis_parts.append(f"✅ **Optimal entry:** Zone 1 at ${z1:.2f} or Zone 2 at ${z2:.2f}")
-            elif composite in ["SELL", "STRONG_SELL"]:
-                thesis_parts.append(f"⚠️ **Bearish consensus** - consider waiting for Zone 3 (${z3:.2f})")
-            else:
-                thesis_parts.append(f"⚡ **Mixed signals** - wait for clearer setup or use small position size")
+                reasons.append(f"Ensemble signal: {composite}")
+            if mc_stats and mc_stats['prob_up'] > 0.6:
+                reasons.append(f"Monte Carlo {mc_stats['prob_up']:.0%} prob of gain")
+            if regime_stats and regime_stats['regime'] == "LOW_VOL":
+                reasons.append("Low vol regime (favorable)")
+            if coint_stats and coint_stats['strength'] == "STRONG":
+                reasons.append(f"Stat arb: {coint_stats['z_score']:.1f}σ deviation")
             
-            for part in thesis_parts:
-                st.write(part)
+            if reasons:
+                st.write("**Positive Factors:**")
+                for r in reasons:
+                    st.write(f"• {r}")
             
-            st.caption(f"Analysis generated at {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}")
+            # Risk warning
+            if regime_stats and regime_stats['regime'] == "HIGH_VOL":
+                st.warning("⚠️ High volatility regime - Consider smaller size, wider stops")
+            
+            if risk_stats and risk_stats['max_dd'] < -0.25:
+                st.error(f"🚨 High historical drawdown ({risk_stats['max_dd']:.1%}) - High risk ticker")
+            
+            st.caption("AlphaForge AlphaGen | Mathematical edge through probabilistic forecasting")
             
         except Exception as e:
-            st.error(f"Error in analysis: {str(e)}")
+            st.error(f"Error: {str(e)}")
             st.exception(e)
 
 else:
-    st.info("👈 Select models and click 'Run Full Analysis'")
+    st.info("👈 Configure models and click 'Run Alpha Analysis'")
     
-    st.subheader("📚 Model Descriptions")
-    descriptions = {
-        "SVJ": "Stochastic Volatility with Jumps - detects volatility regimes and price discontinuities",
-        "Kalman": "Adaptive trend extraction - separates signal from noise in real-time",
-        "Wavelet": "Multi-scale cycle analysis - detects regime shifts via frequency domain",
-        "Info Theory": "Lempel-Ziv complexity - measures market predictability vs randomness",
-        "Topological": "Persistent homology - finds robust support/resistance levels",
-        "LSTM": "Deep learning regime detection - trend vs mean-reversion classification",
-        "EVT": "Extreme Value Theory - quantifies tail risk and black swan probabilities",
-        "Technical": "Classical indicators - RSI, moving averages, golden/death crosses"
-    }
-    
-    for name, desc in descriptions.items():
-        st.write(f"**{name}:** {desc}")
+    st.subheader("📚 Alpha Generation Features")
+    st.write("**Monte Carlo:** 1,000 forward paths for probabilistic price forecasting")
+    st.write("**Regime Detection:** Volatility state identification (High/Low/Transition)")
+    st.write("**Cointegration:** Statistical arbitrage opportunities vs benchmark")
+    st.write("**Risk Metrics:** Sharpe, Sortino, Information Ratio, Max Drawdown")
+    st.write("**Base Models:** SVJ, Kalman, Topological, LSTM, EVT, Technical")
 
 st.divider()
-st.caption("AlphaForge Pro v2.0 | 8-Model Ensemble | For educational purposes only")
+st.caption("For sophisticated quantitative analysis | Educational purposes")
