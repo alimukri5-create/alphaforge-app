@@ -11,18 +11,38 @@ from datetime import datetime, timedelta
 warnings.filterwarnings('ignore')
 
 # ==========================================
-# SETUP SCANNER CODE (Integrated)
+# HELPER FUNCTION FOR YFINANCE DATA
 # ==========================================
 
 def safe_close(df, ticker=None):
     """Safely extract close prices from yfinance dataframe handling MultiIndex"""
     if df is None or df.empty:
         return None
-    if isinstance(df.columns, pd.MultiIndex):
-        if ticker and ticker in df.columns.get_level_values(1):
-            return df['Close'][ticker]
-        return df['Close'].iloc[:, 0]
-    return df['Close']
+    try:
+        if isinstance(df.columns, pd.MultiIndex):
+            if ticker and ticker in df.columns.get_level_values(1):
+                return df['Close'][ticker]
+            return df['Close'].iloc[:, 0]
+        return df['Close']
+    except:
+        return None
+
+def safe_high_low_vol(df, ticker=None):
+    """Safely extract high, low, volume"""
+    if df is None or df.empty:
+        return None, None, None
+    try:
+        if isinstance(df.columns, pd.MultiIndex):
+            if ticker and ticker in df.columns.get_level_values(1):
+                return df['High'][ticker], df['Low'][ticker], df['Volume'][ticker]
+            return df['High'].iloc[:, 0], df['Low'].iloc[:, 0], df['Volume'].iloc[:, 0]
+        return df['High'], df['Low'], df['Volume']
+    except:
+        return None, None, None
+
+# ==========================================
+# SETUP SCANNER CODE
+# ==========================================
 
 class LongOnlyScanner:
     def __init__(self):
@@ -78,22 +98,17 @@ class LongOnlyScanner:
         return status
     
     def squeeze_breakout_signal(self, ticker):
+        """Volatility compression breakout detection"""
         try:
             df = yf.download(ticker, period="6mo", progress=False)
             if df.empty or len(df) < 50:
-                return False, 0, "No data"
+                return False, 0, "No data", None
             
-            # Handle MultiIndex
-            if isinstance(df.columns, pd.MultiIndex):
-                close = df['Close'][ticker] if ticker in df.columns.get_level_values(1) else df['Close'].iloc[:, 0]
-                high = df['High'][ticker] if ticker in df.columns.get_level_values(1) else df['High'].iloc[:, 0]
-                low = df['Low'][ticker] if ticker in df.columns.get_level_values(1) else df['Low'].iloc[:, 0]
-                volume = df['Volume'][ticker] if ticker in df.columns.get_level_values(1) else df['Volume'].iloc[:, 0]
-            else:
-                close = df['Close']
-                high = df['High']
-                low = df['Low']
-                volume = df['Volume']
+            close = safe_close(df, ticker)
+            high, low, volume = safe_high_low_vol(df, ticker)
+            
+            if close is None or volume is None:
+                return False, 0, "Data error", None
             
             sma20 = close.rolling(20).mean()
             std20 = close.rolling(20).std()
@@ -136,10 +151,10 @@ class LongOnlyScanner:
             elif not volume_confirmed:
                 reason = "Low volume"
             
-            return is_setup, score, reason
+            return is_setup, score, reason, curr_close
             
         except Exception as e:
-            return False, 0, f"Error: {str(e)}"
+            return False, 0, f"Error: {str(e)}", None
     
     def relative_strength_check(self, ticker, lookback=20):
         try:
@@ -181,31 +196,50 @@ def scan_watchlist(watchlist):
     scanner = LongOnlyScanner()
     market_ok = scanner.check_market_regime()
     if not market_ok:
-        return [], scanner.get_market_status_text()
+        return [], scanner.get_market_status_text(), []
     
     results = []
+    rejected = []
+    
     progress_bar = st.progress(0)
+    status_text = st.empty()
+    
     for i, ticker in enumerate(watchlist):
         progress_bar.progress((i + 1) / len(watchlist))
+        status_text.text(f"Scanning {ticker}... ({i+1}/{len(watchlist)})")
         
-        is_squeeze, squeeze_score, reason = scanner.squeeze_breakout_signal(ticker)
-        rs_ok, rs_score = scanner.relative_strength_check(ticker)
-        event_ok, event_msg = scanner.check_events(ticker)
-        
-        if is_squeeze and rs_ok and event_ok:
-            total_score = (squeeze_score * 0.6) + (rs_score * 0.4)
-            results.append({
-                'Ticker': ticker,
-                'Setup': 'Squeeze Breakout',
-                'Score': int(total_score),
-                'Squeeze_Reason': reason,
-                'Event_Status': event_msg,
-                'Entry_Quality': 'HIGH' if total_score > 80 else 'MEDIUM'
-            })
+        try:
+            is_squeeze, squeeze_score, reason, price = scanner.squeeze_breakout_signal(ticker)
+            rs_ok, rs_score = scanner.relative_strength_check(ticker)
+            event_ok, event_msg = scanner.check_events(ticker)
+            
+            if is_squeeze and rs_ok and event_ok:
+                total_score = (squeeze_score * 0.6) + (rs_score * 0.4)
+                results.append({
+                    'Ticker': ticker,
+                    'Price': f"${price:.2f}" if price else "N/A",
+                    'Setup': 'Squeeze Breakout',
+                    'Score': int(total_score),
+                    'Squeeze_Reason': reason,
+                    'Event_Status': event_msg,
+                    'Entry_Quality': 'HIGH' if total_score > 80 else 'MEDIUM'
+                })
+            else:
+                # Track why it was rejected for debugging
+                if not is_squeeze:
+                    rejected.append(f"{ticker}: {reason}")
+                elif not rs_ok:
+                    rejected.append(f"{ticker}: Weak relative strength")
+                elif not event_ok:
+                    rejected.append(f"{ticker}: {event_msg}")
+        except Exception as e:
+            rejected.append(f"{ticker}: Error - {str(e)}")
     
     progress_bar.empty()
+    status_text.empty()
+    
     results = sorted(results, key=lambda x: x['Score'], reverse=True)
-    return results, scanner.get_market_status_text()
+    return results, scanner.get_market_status_text(), rejected
 
 def get_exit_levels(ticker, entry_price):
     try:
@@ -213,14 +247,11 @@ def get_exit_levels(ticker, entry_price):
         if df.empty:
             return None
         
-        if isinstance(df.columns, pd.MultiIndex):
-            high = df['High'][ticker] if ticker in df.columns.get_level_values(1) else df['High'].iloc[:, 0]
-            low = df['Low'][ticker] if ticker in df.columns.get_level_values(1) else df['Low'].iloc[:, 0]
-            close = df['Close'][ticker] if ticker in df.columns.get_level_values(1) else df['Close'].iloc[:, 0]
-        else:
-            high = df['High']
-            low = df['Low']
-            close = df['Close']
+        close = safe_close(df, ticker)
+        high, low, _ = safe_high_low_vol(df, ticker)
+        
+        if close is None or high is None or low is None:
+            return None
             
         high_low = high - low
         high_close = np.abs(high - close.shift())
@@ -242,8 +273,30 @@ def get_exit_levels(ticker, entry_price):
     except:
         return None
 
-def setup_scanner_tab():
-    st.header("🎯 Long-Only Setup Scanner")
+# ==========================================
+# STREAMLIT APP LAYOUT
+# ==========================================
+
+st.set_page_config(page_title="AlphaForge Alpha", page_icon="🎯", layout="wide")
+
+st.title("🎯 AlphaForge Alpha Generation")
+st.subheader("Probabilistic Forecasting & Statistical Edge")
+
+# Create tabs at the top level so they always exist
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📊 Price & Zones", 
+    "🎲 Monte Carlo", 
+    "🧠 Model Consensus", 
+    "⚠️ Risk & Regime",
+    "🎯 Setup Scanner"
+])
+
+# ==========================================
+# TAB 5: SETUP SCANNER (Standalone)
+# ==========================================
+
+with tab5:
+    st.header("Long-Only Setup Scanner")
     st.caption("Squeeze breakout detection + Market regime filter")
     
     scanner = LongOnlyScanner()
@@ -254,53 +307,71 @@ def setup_scanner_tab():
     else:
         st.error("🛑 MARKET REGIME: NO NEW LONGS")
         st.warning("SPY below weekly/daily trends OR VIX > 25. Avoid new entries.")
-        return
     
     st.divider()
     st.subheader("Scan Watchlist")
     
     default_list = "AAPL, MSFT, NVDA, TSLA, AMD, NFLX, CRM, META, AMZN, GOOGL, COIN, HOOD, RBLX, U"
-    watchlist_input = st.text_area("Enter tickers (comma-separated):", value=default_list)
+    watchlist_input = st.text_area("Enter tickers (comma-separated):", value=default_list, height=100)
     
-    if st.button("🔍 SCAN FOR SETUPS", type="primary"):
+    if market_ok and st.button("🔍 SCAN FOR SETUPS", type="primary"):
         tickers = [t.strip().upper() for t in watchlist_input.split(",") if t.strip()]
         
-        with st.spinner(f"Scanning {len(tickers)} tickers..."):
-            results, market_msg = scan_watchlist(tickers)
+        if len(tickers) > 20:
+            st.warning("Scanning more than 20 tickers may be slow. Consider narrowing your list.")
+        
+        results, market_msg, rejected = scan_watchlist(tickers)
         
         if not results:
-            st.info("No squeeze breakout setups found.")
-            st.caption("Look for: Price breaking upper Bollinger Band after 5+ days compression + volume spike.")
+            st.info("No squeeze breakout setups found matching criteria.")
+            with st.expander("See why stocks were rejected"):
+                for r in rejected[:10]:  # Show first 10
+                    st.write(f"• {r}")
+                if len(rejected) > 10:
+                    st.write(f"... and {len(rejected) - 10} more")
         else:
-            st.success(f"Found {len(results)} setup(s)")
+            st.success(f"Found {len(results)} setup(s) out of {len(tickers)} scanned")
             
             df = pd.DataFrame(results)
-            st.dataframe(df[['Ticker', 'Score', 'Entry_Quality', 'Squeeze_Reason', 'Event_Status']], 
-                        use_container_width=True, hide_index=True)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            
+            st.divider()
+            st.subheader("Detailed Analysis")
             
             for result in results:
                 with st.expander(f"{result['Ticker']} (Score: {result['Score']}/100)"):
                     try:
-                        hist = yf.Ticker(result['Ticker']).history(period="1d")
-                        current_price = float(safe_close(hist, result['Ticker']).iloc[-1]) if not hist.empty else None
-                        exits = get_exit_levels(result['Ticker'], current_price) if current_price else None
+                        price_str = result['Price'].replace('$', '')
+                        current_price = float(price_str)
+                        exits = get_exit_levels(result['Ticker'], current_price)
                         
                         if exits:
-                            col1, col2 = st.columns(2)
+                            col1, col2, col3 = st.columns(3)
                             with col1:
-                                st.write(f"**Current:** ${current_price:.2f}")
+                                st.write(f"**Current:** {result['Price']}")
                                 st.write(f"**Setup:** {result['Squeeze_Reason']}")
                             with col2:
-                                st.write(f"**Stop:** ${exits['stop_loss']:.2f} ({exits['risk_pct']:.1f}%)")
+                                st.write(f"**Stop:** ${exits['stop_loss']:.2f}")
+                                st.write(f"**Risk:** {exits['risk_pct']:.1f}%")
+                            with col3:
                                 st.write(f"**Target (3R):** ${exits['target']:.2f}")
-                    except:
-                        st.write("Price data unavailable")
+                                st.write(f"**Quality:** {result['Entry_Quality']}")
+                        else:
+                            st.write(f"**Current:** {result['Price']}")
+                            st.write(f"**Setup:** {result['Squeeze_Reason']}")
+                    except Exception as e:
+                        st.write(f"Error loading details: {e}")
+    
+    elif not market_ok:
+        st.button("🔍 SCAN FOR SETUPS", type="primary", disabled=True)
+        st.info("Scanning disabled due to unfavorable market regime.")
     
     st.divider()
     st.subheader("Position Monitor")
     col1, col2 = st.columns(2)
     with col1:
         pos_ticker = st.text_input("Ticker", key="pos_ticker").upper()
+    with col2:
         entry_price = st.number_input("Entry Price", min_value=0.0, format="%.2f", key="entry_price")
     
     if pos_ticker and entry_price > 0:
@@ -312,8 +383,11 @@ def setup_scanner_tab():
                 
                 if current:
                     pnl_pct = ((current - entry_price) / entry_price) * 100
-                    st.write(f"**Current:** ${current:.2f} ({pnl_pct:+.1f}%)")
-                    st.write(f"**Stop Level:** ${exits['stop_loss']:.2f}")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Current", f"${current:.2f}", f"{pnl_pct:+.1f}%")
+                    col2.metric("Stop", f"${exits['stop_loss']:.2f}")
+                    col3.metric("Target", f"${exits['target']:.2f}")
                     
                     if current < exits['stop_loss']:
                         st.error("🚨 STOP HIT - EXIT NOW")
@@ -321,20 +395,19 @@ def setup_scanner_tab():
                         st.success("🎯 TARGET HIT - Take 1/2 profits")
                     else:
                         st.info("⏱️ HOLD - Within risk range")
-        except:
-            st.error("Could not fetch position data")
+                else:
+                    st.error("Could not fetch current price")
+            else:
+                st.error("Could not calculate exit levels")
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
 
 # ==========================================
-# ORIGINAL ALPHAFORGE APP CODE
+# SIDEBAR FOR MAIN ANALYSIS
 # ==========================================
-
-st.set_page_config(page_title="AlphaForge Alpha", page_icon="🎯", layout="wide")
-
-st.title("🎯 AlphaForge Alpha Generation")
-st.subheader("Probabilistic Forecasting & Statistical Edge")
 
 st.sidebar.header("📊 Analysis Settings")
-ticker = st.sidebar.text_input("Ticker Symbol", value="MSFT").upper()
+ticker = st.sidebar.text_input("Ticker Symbol", value="MSFT", key="main_ticker").upper()
 benchmark = st.sidebar.text_input("Benchmark", value="SPY").upper()
 timeframe = st.sidebar.selectbox("Timeframe", ["1y", "2y", "5y"], index=1)
 
@@ -494,7 +567,7 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
                 tech_sig = ("OFF", 0, "Disabled")
             
             # ==========================================
-            # ALPHA GENERATION MODELS (The New Stuff)
+            # ALPHA GENERATION MODELS
             # ==========================================
             
             # 1. MONTE CARLO FORWARD SIMULATION
@@ -526,14 +599,13 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
             else:
                 mc_stats = None
             
-            # 2. REGIME DETECTION (Hidden Markov Style)
+            # 2. REGIME DETECTION 
             if regime_on:
                 vol_20 = returns.rolling(20).std() * np.sqrt(252)
                 vol_mean = vol_20.mean()
                 vol_std = vol_20.std()
                 current_vol = vol_20.iloc[-1]
                 
-                # Regime classification
                 if current_vol > vol_mean + vol_std:
                     regime = "HIGH_VOL"
                     regime_conf = 0.8
@@ -561,11 +633,10 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
             else:
                 regime_stats = None
             
-            # 3. COINTEGRATION / STATISTICAL ARBITRAGE
+            # 3. COINTEGRATION 
             if coint_on and aligned_bench is not None:
                 correlation = aligned_returns.corr(aligned_bench)
                 
-                # Price ratio z-score
                 price_ratio = prices / bench_prices.reindex(prices.index, method='ffill')
                 ratio_mean = price_ratio.mean()
                 ratio_std = price_ratio.std()
@@ -599,21 +670,17 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
             
             # 4. ADVANCED RISK METRICS
             if risk_on and aligned_bench is not None:
-                # Sharpe
                 sharpe = (returns.mean() / returns.std()) * np.sqrt(252) if returns.std() > 0 else 0
                 
-                # Information Ratio (alpha vs benchmark)
                 excess = aligned_returns - aligned_bench
                 tracking_err = excess.std() * np.sqrt(252)
                 info_ratio = (excess.mean() * 252) / tracking_err if tracking_err > 0 else 0
                 
-                # Max Drawdown
                 cum_ret = (1 + returns).cumprod()
                 running_max = cum_ret.expanding().max()
                 drawdown = (cum_ret - running_max) / running_max
                 max_dd = drawdown.min()
                 
-                # Sortino
                 downside = returns[returns < 0]
                 downside_vol = downside.std() * np.sqrt(252) if len(downside) > 0 else 0.01
                 sortino = (returns.mean() * 252) / downside_vol if downside_vol > 0 else 0
@@ -658,9 +725,9 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
             base_mult = 1.0
             if regime_stats:
                 if regime_stats['regime'] == "HIGH_VOL":
-                    base_mult = 1.3  # Wider zones
+                    base_mult = 1.3
                 elif regime_stats['regime'] == "LOW_VOL":
-                    base_mult = 0.9  # Tighter zones
+                    base_mult = 0.9
             
             z1 = current_price * (1 - 0.02 * base_mult)
             z2 = current_price * (1 - 0.05 * base_mult)
@@ -668,40 +735,28 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
             z2 = max(z2, recent_support * 0.98)
             
             # ==========================================
-            # DISPLAY - 5 TABS (Added Setup Scanner)
+            # DISPLAY OTHER TABS
             # ==========================================
             
-            st.success(f"✅ Alpha analysis complete for {ticker}")
-            
-            # Top Metrics
-            cols = st.columns([1, 1, 1, 1, 1.5])
-            cols[0].metric("Price", f"${current_price:.2f}")
-            cols[1].metric("Signal", composite, f"{confidence}%")
-            cols[2].metric("Volatility", f"{vol:.1%}")
-            if risk_stats:
-                cols[3].metric("Sharpe", f"{risk_stats['sharpe']:.2f}")
-                cols[4].metric("Max DD", f"{risk_stats['max_dd']:.1%}")
-            else:
-                cols[3].metric("Jumps/Yr", f"{jump_intensity:.1f}")
-            
-            st.divider()
-            
-            # Main tabs - NOW 5 TABS INSTEAD OF 4
-            tab1, tab2, tab3, tab4, tab5 = st.tabs([
-                "📊 Price & Zones", 
-                "🎲 Monte Carlo", 
-                "🧠 Model Consensus", 
-                "⚠️ Risk & Regime",
-                "🎯 Setup Scanner"  # NEW TAB
-            ])
-            
             with tab1:
-                # Price chart with zones
+                st.success(f"✅ Alpha analysis complete for {ticker}")
+                
+                cols = st.columns([1, 1, 1, 1, 1.5])
+                cols[0].metric("Price", f"${current_price:.2f}")
+                cols[1].metric("Signal", composite, f"{confidence}%")
+                cols[2].metric("Volatility", f"{vol:.1%}")
+                if risk_stats:
+                    cols[3].metric("Sharpe", f"{risk_stats['sharpe']:.2f}")
+                    cols[4].metric("Max DD", f"{risk_stats['max_dd']:.1%}")
+                else:
+                    cols[3].metric("Jumps/Yr", f"{jump_intensity:.1f}")
+                
+                st.divider()
+                
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=prices.index, y=prices, mode='lines', 
                                         name='Price', line=dict(color='black', width=2)))
                 
-                # Zone bands
                 fig.add_hrect(y0=z1, y1=current_price, fillcolor="green", opacity=0.2, 
                              annotation_text="Zone 1")
                 fig.add_hrect(y0=z2, y1=z1, fillcolor="blue", opacity=0.2, 
@@ -712,7 +767,6 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
                 fig.update_layout(height=500, title=f"{ticker} Price Action")
                 st.plotly_chart(fig, use_container_width=True)
                 
-                # Zone table
                 zone_df = pd.DataFrame({
                     'Zone': ['Zone 1 (Immediate)', 'Zone 2 (Support)', 'Zone 3 (Deep Value)'],
                     'Price Range': [f"${z1:.2f} - ${current_price:.2f}",
@@ -727,10 +781,8 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
                 if mc_stats:
                     st.subheader("Monte Carlo Forward Simulation (30 Days)")
                     
-                    # Plot paths
                     fig_mc = go.Figure()
                     
-                    # Sample paths
                     for i in range(0, min(100, len(mc_stats['paths'])), 5):
                         fig_mc.add_trace(go.Scatter(
                             x=list(range(30)), y=mc_stats['paths'][i],
@@ -738,7 +790,6 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
                             opacity=0.2, showlegend=False
                         ))
                     
-                    # Percentiles
                     fig_mc.add_trace(go.Scatter(x=list(range(30)), 
                                                y=np.percentile(mc_stats['paths'], 95, axis=0),
                                                mode='lines', line=dict(color='green', width=2),
@@ -756,7 +807,6 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
                     fig_mc.update_layout(height=400, xaxis_title="Days", yaxis_title="Price ($)")
                     st.plotly_chart(fig_mc, use_container_width=True)
                     
-                    # MC stats
                     mc_cols = st.columns(4)
                     mc_cols[0].metric("Prob Up", f"{mc_stats['prob_up']:.1%}")
                     mc_cols[1].metric("Expected", f"${mc_stats['median']:.2f}", 
@@ -777,7 +827,6 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
                     with st.expander(f"{emoji} {name}: {sig[0]} ({sig[1]}%)"):
                         st.write(sig[2])
                 
-                # Net score
                 st.info(f"**Ensemble Net Score:** {net:.2f} (Bullish: {bullish}, Bearish: {bearish})")
             
             with tab4:
@@ -821,10 +870,6 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
                     else:
                         st.success(f"✅ **{coint_stats['signal']}** - {coint_stats['trade']}")
             
-            # NEW TAB 5 - Setup Scanner
-            with tab5:
-                setup_scanner_tab()
-            
             st.divider()
             
             # Final recommendation
@@ -852,21 +897,9 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
             if risk_stats and risk_stats['max_dd'] < -0.25:
                 st.error(f"🚨 High historical drawdown ({risk_stats['max_dd']:.1%}) - High risk ticker")
             
-            st.caption("AlphaForge AlphaGen | Mathematical edge through probabilistic forecasting")
-            
         except Exception as e:
             st.error(f"Error: {str(e)}")
             st.exception(e)
-
-else:
-    st.info("👈 Configure models and click 'Run Alpha Analysis'")
-    
-    st.subheader("📚 Alpha Generation Features")
-    st.write("**Monte Carlo:** 1,000 forward paths for probabilistic price forecasting")
-    st.write("**Regime Detection:** Volatility state identification (High/Low/Transition)")
-    st.write("**Cointegration:** Statistical arbitrage opportunities vs benchmark")
-    st.write("**Risk Metrics:** Sharpe, Sortino, Information Ratio, Max Drawdown")
-    st.write("**Base Models:** SVJ, Kalman, Topological, LSTM, EVT, Technical")
 
 st.divider()
 st.caption("For sophisticated quantitative analysis | Educational purposes")
