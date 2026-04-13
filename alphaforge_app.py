@@ -14,6 +14,16 @@ warnings.filterwarnings('ignore')
 # SETUP SCANNER CODE (Integrated)
 # ==========================================
 
+def safe_close(df, ticker=None):
+    """Safely extract close prices from yfinance dataframe handling MultiIndex"""
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        if ticker and ticker in df.columns.get_level_values(1):
+            return df['Close'][ticker]
+        return df['Close'].iloc[:, 0]
+    return df['Close']
+
 class LongOnlyScanner:
     def __init__(self):
         self.spy_data = None
@@ -27,19 +37,26 @@ class LongOnlyScanner:
         """Global gate: Is market safe for long entries?"""
         try:
             self.spy_data = yf.download("SPY", period="1y", progress=False)
-            if self.spy_data.empty:
+            spy_close = safe_close(self.spy_data, "SPY")
+            
+            if spy_close is None or spy_close.empty:
                 return False
                 
-            weekly_spy = self.spy_data.resample('W-Fri').last()
-            weekly_ema20 = weekly_spy['Close'].ewm(span=20, adjust=False).mean()
-            self.weekly_trend = weekly_spy['Close'].iloc[-1] > weekly_ema20.iloc[-1]
+            # Weekly trend (20 EMA)
+            weekly_spy = spy_close.resample('W-Fri').last()
+            weekly_ema20 = weekly_spy.ewm(span=20, adjust=False).mean()
+            self.weekly_trend = bool(weekly_spy.iloc[-1] > weekly_ema20.iloc[-1])
             
-            sma50 = self.spy_data['Close'].rolling(50).mean()
-            self.daily_trend = self.spy_data['Close'].iloc[-1] > sma50.iloc[-1]
+            # Daily trend (50 SMA)
+            sma50 = spy_close.rolling(50).mean()
+            self.daily_trend = bool(spy_close.iloc[-1] > sma50.iloc[-1])
             
+            # VIX check
             self.vix_data = yf.download("^VIX", period="5d", progress=False)
-            if not self.vix_data.empty:
-                vix_current = self.vix_data['Close'].iloc[-1]
+            vix_close = safe_close(self.vix_data, "^VIX")
+            
+            if vix_close is not None and not vix_close.empty:
+                vix_current = float(vix_close.iloc[-1])
                 self.vix_low = vix_current < 25
             else:
                 self.vix_low = True
@@ -66,21 +83,36 @@ class LongOnlyScanner:
             if df.empty or len(df) < 50:
                 return False, 0, "No data"
             
-            df['SMA20'] = df['Close'].rolling(20).mean()
-            df['STD20'] = df['Close'].rolling(20).std()
-            df['Upper'] = df['SMA20'] + (2 * df['STD20'])
-            df['Lower'] = df['SMA20'] - (2 * df['STD20'])
-            df['Bandwidth'] = (df['Upper'] - df['Lower']) / df['SMA20']
-            df['Squeeze'] = df['Bandwidth'] <= df['Bandwidth'].rolling(120).min()
-            df['VolAvg'] = df['Volume'].rolling(20).mean()
+            # Handle MultiIndex
+            if isinstance(df.columns, pd.MultiIndex):
+                close = df['Close'][ticker] if ticker in df.columns.get_level_values(1) else df['Close'].iloc[:, 0]
+                high = df['High'][ticker] if ticker in df.columns.get_level_values(1) else df['High'].iloc[:, 0]
+                low = df['Low'][ticker] if ticker in df.columns.get_level_values(1) else df['Low'].iloc[:, 0]
+                volume = df['Volume'][ticker] if ticker in df.columns.get_level_values(1) else df['Volume'].iloc[:, 0]
+            else:
+                close = df['Close']
+                high = df['High']
+                low = df['Low']
+                volume = df['Volume']
             
-            curr = df.iloc[-1]
-            prev = df.iloc[-2]
+            sma20 = close.rolling(20).mean()
+            std20 = close.rolling(20).std()
+            upper = sma20 + (2 * std20)
+            lower = sma20 - (2 * std20)
+            bandwidth = (upper - lower) / sma20
+            squeeze = bandwidth <= bandwidth.rolling(120).min()
+            vol_avg = volume.rolling(20).mean()
             
-            price_breakout = curr['Close'] > prev['Upper']
-            volume_confirmed = curr['Volume'] > (prev['VolAvg'] * 1.3)
-            was_in_squeeze = prev['Squeeze']
-            squeeze_duration = df['Squeeze'].iloc[-20:].sum()
+            curr_close = float(close.iloc[-1])
+            prev_close = float(close.iloc[-2])
+            curr_upper = float(upper.iloc[-2])
+            curr_vol = float(volume.iloc[-1])
+            prev_vol_avg = float(vol_avg.iloc[-2])
+            
+            price_breakout = curr_close > curr_upper
+            volume_confirmed = curr_vol > (prev_vol_avg * 1.3)
+            was_in_squeeze = bool(squeeze.iloc[-2])
+            squeeze_duration = int(squeeze.iloc[-20:].sum())
             
             is_setup = price_breakout and volume_confirmed and was_in_squeeze
             
@@ -89,14 +121,14 @@ class LongOnlyScanner:
                 score = 50
                 if squeeze_duration >= 5:
                     score += 20
-                if curr['Volume'] > (prev['VolAvg'] * 2):
+                if curr_vol > (prev_vol_avg * 2):
                     score += 20
-                if curr['Close'] > curr['SMA20']:
+                if curr_close > float(sma20.iloc[-1]):
                     score += 10
             
             reason = ""
             if is_setup:
-                reason = f"Squeeze breakout ({int(squeeze_duration)} days compression)"
+                reason = f"Squeeze breakout ({squeeze_duration} days compression)"
             elif not was_in_squeeze:
                 reason = "No squeeze detected"
             elif not price_breakout:
@@ -111,14 +143,19 @@ class LongOnlyScanner:
     
     def relative_strength_check(self, ticker, lookback=20):
         try:
-            stock = yf.download(ticker, period="3mo", progress=False)['Close']
-            spy = self.spy_data['Close'] if self.spy_data is not None else yf.download("SPY", period="3mo", progress=False)['Close']
+            stock_df = yf.download(ticker, period="3mo", progress=False)
+            stock_close = safe_close(stock_df, ticker)
             
-            if stock.empty or spy.empty or len(stock) < lookback:
+            spy_close = safe_close(self.spy_data, "SPY")
+            if spy_close is None or spy_close.empty:
+                spy_df = yf.download("SPY", period="3mo", progress=False)
+                spy_close = safe_close(spy_df, "SPY")
+            
+            if stock_close is None or spy_close is None or len(stock_close) < lookback:
                 return False, 0
             
-            stock_ret = (stock.iloc[-1] / stock.iloc[-lookback] - 1)
-            spy_ret = (spy.iloc[-1] / spy.iloc[-lookback] - 1)
+            stock_ret = (float(stock_close.iloc[-1]) / float(stock_close.iloc[-lookback]) - 1)
+            spy_ret = (float(spy_close.iloc[-1]) / float(spy_close.iloc[-lookback]) - 1)
             
             rs_ok = stock_ret >= (spy_ret - 0.03)
             rs_score = min(100, max(0, (stock_ret - spy_ret + 0.05) * 500))
@@ -175,10 +212,19 @@ def get_exit_levels(ticker, entry_price):
         df = yf.download(ticker, period="3mo", progress=False)
         if df.empty:
             return None
+        
+        if isinstance(df.columns, pd.MultiIndex):
+            high = df['High'][ticker] if ticker in df.columns.get_level_values(1) else df['High'].iloc[:, 0]
+            low = df['Low'][ticker] if ticker in df.columns.get_level_values(1) else df['Low'].iloc[:, 0]
+            close = df['Close'][ticker] if ticker in df.columns.get_level_values(1) else df['Close'].iloc[:, 0]
+        else:
+            high = df['High']
+            low = df['Low']
+            close = df['Close']
             
-        high_low = df['High'] - df['Low']
-        high_close = np.abs(df['High'] - df['Close'].shift())
-        low_close = np.abs(df['Low'] - df['Close'].shift())
+        high_low = high - low
+        high_close = np.abs(high - close.shift())
+        low_close = np.abs(low - close.shift())
         ranges = pd.concat([high_low, high_close, low_close], axis=1)
         true_range = np.max(ranges, axis=1)
         atr = true_range.rolling(14).mean().iloc[-1]
@@ -235,8 +281,9 @@ def setup_scanner_tab():
             for result in results:
                 with st.expander(f"{result['Ticker']} (Score: {result['Score']}/100)"):
                     try:
-                        current_price = yf.Ticker(result['Ticker']).history(period="1d")['Close'].iloc[-1]
-                        exits = get_exit_levels(result['Ticker'], current_price)
+                        hist = yf.Ticker(result['Ticker']).history(period="1d")
+                        current_price = float(safe_close(hist, result['Ticker']).iloc[-1]) if not hist.empty else None
+                        exits = get_exit_levels(result['Ticker'], current_price) if current_price else None
                         
                         if exits:
                             col1, col2 = st.columns(2)
@@ -260,18 +307,20 @@ def setup_scanner_tab():
         try:
             exits = get_exit_levels(pos_ticker, entry_price)
             if exits:
-                current = yf.Ticker(pos_ticker).history(period="1d")['Close'].iloc[-1]
-                pnl_pct = ((current - entry_price) / entry_price) * 100
+                hist = yf.Ticker(pos_ticker).history(period="1d")
+                current = float(safe_close(hist, pos_ticker).iloc[-1]) if not hist.empty else None
                 
-                st.write(f"**Current:** ${current:.2f} ({pnl_pct:+.1f}%)")
-                st.write(f"**Stop Level:** ${exits['stop_loss']:.2f}")
-                
-                if current < exits['stop_loss']:
-                    st.error("🚨 STOP HIT - EXIT NOW")
-                elif current > exits['target']:
-                    st.success("🎯 TARGET HIT - Take 1/2 profits")
-                else:
-                    st.info("⏱️ HOLD - Within risk range")
+                if current:
+                    pnl_pct = ((current - entry_price) / entry_price) * 100
+                    st.write(f"**Current:** ${current:.2f} ({pnl_pct:+.1f}%)")
+                    st.write(f"**Stop Level:** ${exits['stop_loss']:.2f}")
+                    
+                    if current < exits['stop_loss']:
+                        st.error("🚨 STOP HIT - EXIT NOW")
+                    elif current > exits['target']:
+                        st.success("🎯 TARGET HIT - Take 1/2 profits")
+                    else:
+                        st.info("⏱️ HOLD - Within risk range")
         except:
             st.error("Could not fetch position data")
 
@@ -319,13 +368,21 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
                 st.error("No data found")
                 st.stop()
             
-            prices = data['Close']
+            # Handle MultiIndex columns
+            if isinstance(data.columns, pd.MultiIndex):
+                prices = data['Close'][ticker] if ticker in data.columns.get_level_values(1) else data['Close'].iloc[:, 0]
+            else:
+                prices = data['Close']
+                
             current_price = float(prices.iloc[-1])
             returns = prices.pct_change().dropna()
             
             # Load benchmark if available
             if not bench_data.empty and coint_on:
-                bench_prices = bench_data['Close']
+                if isinstance(bench_data.columns, pd.MultiIndex):
+                    bench_prices = bench_data['Close'][benchmark] if benchmark in bench_data.columns.get_level_values(1) else bench_data['Close'].iloc[:, 0]
+                else:
+                    bench_prices = bench_data['Close']
                 bench_returns = bench_prices.pct_change().dropna()
                 # Align lengths
                 min_len = min(len(returns), len(bench_returns))
@@ -376,10 +433,10 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
                 local_min = argrelextrema(prices.values, np.less, order=10)[0]
                 
                 if len(local_min) > 0:
-                    recent_support = prices.iloc[local_min[-1]]
+                    recent_support = float(prices.iloc[local_min[-1]])
                     persistence = len(prices) - local_min[-1]
                 else:
-                    recent_support = prices.tail(60).min()
+                    recent_support = float(prices.tail(60).min())
                     persistence = 0
                 
                 if current_price < recent_support * 1.02:
@@ -388,7 +445,7 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
                     topo_sig = ("NEUTRAL", 50, f"Support ${recent_support:.2f}")
             else:
                 topo_sig = ("OFF", 0, "Disabled")
-                recent_support = prices.tail(60).min()
+                recent_support = float(prices.tail(60).min())
             
             # LSTM
             if lstm_on:
