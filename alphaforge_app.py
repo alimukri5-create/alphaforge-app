@@ -5,8 +5,279 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy import stats
+from scipy.signal import argrelextrema
 import warnings
+from datetime import datetime, timedelta
 warnings.filterwarnings('ignore')
+
+# ==========================================
+# SETUP SCANNER CODE (Integrated)
+# ==========================================
+
+class LongOnlyScanner:
+    def __init__(self):
+        self.spy_data = None
+        self.vix_data = None
+        self.weekly_trend = None
+        self.daily_trend = None
+        self.vix_low = None
+        self.market_ok = False
+        
+    def check_market_regime(self):
+        """Global gate: Is market safe for long entries?"""
+        try:
+            self.spy_data = yf.download("SPY", period="1y", progress=False)
+            if self.spy_data.empty:
+                return False
+                
+            weekly_spy = self.spy_data.resample('W-Fri').last()
+            weekly_ema20 = weekly_spy['Close'].ewm(span=20, adjust=False).mean()
+            self.weekly_trend = weekly_spy['Close'].iloc[-1] > weekly_ema20.iloc[-1]
+            
+            sma50 = self.spy_data['Close'].rolling(50).mean()
+            self.daily_trend = self.spy_data['Close'].iloc[-1] > sma50.iloc[-1]
+            
+            self.vix_data = yf.download("^VIX", period="5d", progress=False)
+            if not self.vix_data.empty:
+                vix_current = self.vix_data['Close'].iloc[-1]
+                self.vix_low = vix_current < 25
+            else:
+                self.vix_low = True
+                
+            self.market_ok = self.weekly_trend and self.daily_trend and self.vix_low
+            return self.market_ok
+            
+        except Exception as e:
+            st.error(f"Market regime check failed: {e}")
+            return False
+    
+    def get_market_status_text(self):
+        if not self.market_ok:
+            return "🛑 NO NEW LONGS"
+        status = "✅ MARKET OK FOR LONGS\n\n"
+        status += f"Weekly Trend (SPY): {'UP' if self.weekly_trend else 'DOWN'}\n"
+        status += f"Daily Trend (SPY): {'UP' if self.daily_trend else 'DOWN'}\n"
+        status += f"VIX < 25: {'YES' if self.vix_low else 'NO'}"
+        return status
+    
+    def squeeze_breakout_signal(self, ticker):
+        try:
+            df = yf.download(ticker, period="6mo", progress=False)
+            if df.empty or len(df) < 50:
+                return False, 0, "No data"
+            
+            df['SMA20'] = df['Close'].rolling(20).mean()
+            df['STD20'] = df['Close'].rolling(20).std()
+            df['Upper'] = df['SMA20'] + (2 * df['STD20'])
+            df['Lower'] = df['SMA20'] - (2 * df['STD20'])
+            df['Bandwidth'] = (df['Upper'] - df['Lower']) / df['SMA20']
+            df['Squeeze'] = df['Bandwidth'] <= df['Bandwidth'].rolling(120).min()
+            df['VolAvg'] = df['Volume'].rolling(20).mean()
+            
+            curr = df.iloc[-1]
+            prev = df.iloc[-2]
+            
+            price_breakout = curr['Close'] > prev['Upper']
+            volume_confirmed = curr['Volume'] > (prev['VolAvg'] * 1.3)
+            was_in_squeeze = prev['Squeeze']
+            squeeze_duration = df['Squeeze'].iloc[-20:].sum()
+            
+            is_setup = price_breakout and volume_confirmed and was_in_squeeze
+            
+            score = 0
+            if is_setup:
+                score = 50
+                if squeeze_duration >= 5:
+                    score += 20
+                if curr['Volume'] > (prev['VolAvg'] * 2):
+                    score += 20
+                if curr['Close'] > curr['SMA20']:
+                    score += 10
+            
+            reason = ""
+            if is_setup:
+                reason = f"Squeeze breakout ({int(squeeze_duration)} days compression)"
+            elif not was_in_squeeze:
+                reason = "No squeeze detected"
+            elif not price_breakout:
+                reason = "No price breakout"
+            elif not volume_confirmed:
+                reason = "Low volume"
+            
+            return is_setup, score, reason
+            
+        except Exception as e:
+            return False, 0, f"Error: {str(e)}"
+    
+    def relative_strength_check(self, ticker, lookback=20):
+        try:
+            stock = yf.download(ticker, period="3mo", progress=False)['Close']
+            spy = self.spy_data['Close'] if self.spy_data is not None else yf.download("SPY", period="3mo", progress=False)['Close']
+            
+            if stock.empty or spy.empty or len(stock) < lookback:
+                return False, 0
+            
+            stock_ret = (stock.iloc[-1] / stock.iloc[-lookback] - 1)
+            spy_ret = (spy.iloc[-1] / spy.iloc[-lookback] - 1)
+            
+            rs_ok = stock_ret >= (spy_ret - 0.03)
+            rs_score = min(100, max(0, (stock_ret - spy_ret + 0.05) * 500))
+            
+            return rs_ok, rs_score
+        except:
+            return False, 0
+    
+    def check_events(self, ticker):
+        try:
+            stock = yf.Ticker(ticker)
+            earnings = stock.earnings_dates
+            if earnings is not None and not earnings.empty:
+                next_earnings = earnings.index[0]
+                days_to_earnings = (next_earnings - datetime.now()).days
+                if 0 <= days_to_earnings <= 3:
+                    return False, f"Earnings in {days_to_earnings} days"
+            return True, "No events"
+        except:
+            return True, "Event check unavailable"
+
+def scan_watchlist(watchlist):
+    scanner = LongOnlyScanner()
+    market_ok = scanner.check_market_regime()
+    if not market_ok:
+        return [], scanner.get_market_status_text()
+    
+    results = []
+    progress_bar = st.progress(0)
+    for i, ticker in enumerate(watchlist):
+        progress_bar.progress((i + 1) / len(watchlist))
+        
+        is_squeeze, squeeze_score, reason = scanner.squeeze_breakout_signal(ticker)
+        rs_ok, rs_score = scanner.relative_strength_check(ticker)
+        event_ok, event_msg = scanner.check_events(ticker)
+        
+        if is_squeeze and rs_ok and event_ok:
+            total_score = (squeeze_score * 0.6) + (rs_score * 0.4)
+            results.append({
+                'Ticker': ticker,
+                'Setup': 'Squeeze Breakout',
+                'Score': int(total_score),
+                'Squeeze_Reason': reason,
+                'Event_Status': event_msg,
+                'Entry_Quality': 'HIGH' if total_score > 80 else 'MEDIUM'
+            })
+    
+    progress_bar.empty()
+    results = sorted(results, key=lambda x: x['Score'], reverse=True)
+    return results, scanner.get_market_status_text()
+
+def get_exit_levels(ticker, entry_price):
+    try:
+        df = yf.download(ticker, period="3mo", progress=False)
+        if df.empty:
+            return None
+            
+        high_low = df['High'] - df['Low']
+        high_close = np.abs(df['High'] - df['Close'].shift())
+        low_close = np.abs(df['Low'] - df['Close'].shift())
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = np.max(ranges, axis=1)
+        atr = true_range.rolling(14).mean().iloc[-1]
+        
+        stop_loss = entry_price - (2 * atr)
+        risk = entry_price - stop_loss
+        target = entry_price + (3 * risk)
+        
+        return {
+            'stop_loss': stop_loss,
+            'target': target,
+            'atr': atr,
+            'risk_pct': (risk / entry_price) * 100
+        }
+    except:
+        return None
+
+def setup_scanner_tab():
+    st.header("🎯 Long-Only Setup Scanner")
+    st.caption("Squeeze breakout detection + Market regime filter")
+    
+    scanner = LongOnlyScanner()
+    market_ok = scanner.check_market_regime()
+    
+    if market_ok:
+        st.success(scanner.get_market_status_text())
+    else:
+        st.error("🛑 MARKET REGIME: NO NEW LONGS")
+        st.warning("SPY below weekly/daily trends OR VIX > 25. Avoid new entries.")
+        return
+    
+    st.divider()
+    st.subheader("Scan Watchlist")
+    
+    default_list = "AAPL, MSFT, NVDA, TSLA, AMD, NFLX, CRM, META, AMZN, GOOGL, COIN, HOOD, RBLX, U"
+    watchlist_input = st.text_area("Enter tickers (comma-separated):", value=default_list)
+    
+    if st.button("🔍 SCAN FOR SETUPS", type="primary"):
+        tickers = [t.strip().upper() for t in watchlist_input.split(",") if t.strip()]
+        
+        with st.spinner(f"Scanning {len(tickers)} tickers..."):
+            results, market_msg = scan_watchlist(tickers)
+        
+        if not results:
+            st.info("No squeeze breakout setups found.")
+            st.caption("Look for: Price breaking upper Bollinger Band after 5+ days compression + volume spike.")
+        else:
+            st.success(f"Found {len(results)} setup(s)")
+            
+            df = pd.DataFrame(results)
+            st.dataframe(df[['Ticker', 'Score', 'Entry_Quality', 'Squeeze_Reason', 'Event_Status']], 
+                        use_container_width=True, hide_index=True)
+            
+            for result in results:
+                with st.expander(f"{result['Ticker']} (Score: {result['Score']}/100)"):
+                    try:
+                        current_price = yf.Ticker(result['Ticker']).history(period="1d")['Close'].iloc[-1]
+                        exits = get_exit_levels(result['Ticker'], current_price)
+                        
+                        if exits:
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.write(f"**Current:** ${current_price:.2f}")
+                                st.write(f"**Setup:** {result['Squeeze_Reason']}")
+                            with col2:
+                                st.write(f"**Stop:** ${exits['stop_loss']:.2f} ({exits['risk_pct']:.1f}%)")
+                                st.write(f"**Target (3R):** ${exits['target']:.2f}")
+                    except:
+                        st.write("Price data unavailable")
+    
+    st.divider()
+    st.subheader("Position Monitor")
+    col1, col2 = st.columns(2)
+    with col1:
+        pos_ticker = st.text_input("Ticker", key="pos_ticker").upper()
+        entry_price = st.number_input("Entry Price", min_value=0.0, format="%.2f", key="entry_price")
+    
+    if pos_ticker and entry_price > 0:
+        try:
+            exits = get_exit_levels(pos_ticker, entry_price)
+            if exits:
+                current = yf.Ticker(pos_ticker).history(period="1d")['Close'].iloc[-1]
+                pnl_pct = ((current - entry_price) / entry_price) * 100
+                
+                st.write(f"**Current:** ${current:.2f} ({pnl_pct:+.1f}%)")
+                st.write(f"**Stop Level:** ${exits['stop_loss']:.2f}")
+                
+                if current < exits['stop_loss']:
+                    st.error("🚨 STOP HIT - EXIT NOW")
+                elif current > exits['target']:
+                    st.success("🎯 TARGET HIT - Take 1/2 profits")
+                else:
+                    st.info("⏱️ HOLD - Within risk range")
+        except:
+            st.error("Could not fetch position data")
+
+# ==========================================
+# ORIGINAL ALPHAFORGE APP CODE
+# ==========================================
 
 st.set_page_config(page_title="AlphaForge Alpha", page_icon="🎯", layout="wide")
 
@@ -102,7 +373,6 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
             
             # Topological
             if topo_on:
-                from scipy.signal import argrelextrema
                 local_min = argrelextrema(prices.values, np.less, order=10)[0]
                 
                 if len(local_min) > 0:
@@ -341,7 +611,7 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
             z2 = max(z2, recent_support * 0.98)
             
             # ==========================================
-            # DISPLAY
+            # DISPLAY - 5 TABS (Added Setup Scanner)
             # ==========================================
             
             st.success(f"✅ Alpha analysis complete for {ticker}")
@@ -359,8 +629,14 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
             
             st.divider()
             
-            # Main tabs
-            tab1, tab2, tab3, tab4 = st.tabs(["📊 Price & Zones", "🎲 Monte Carlo", "🧠 Model Consensus", "⚠️ Risk & Regime"])
+            # Main tabs - NOW 5 TABS INSTEAD OF 4
+            tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                "📊 Price & Zones", 
+                "🎲 Monte Carlo", 
+                "🧠 Model Consensus", 
+                "⚠️ Risk & Regime",
+                "🎯 Setup Scanner"  # NEW TAB
+            ])
             
             with tab1:
                 # Price chart with zones
@@ -487,6 +763,10 @@ if st.sidebar.button("🚀 Run Alpha Analysis", type="primary"):
                         st.warning(f"⚠️ **{coint_stats['signal']}** - {coint_stats['trade']}")
                     else:
                         st.success(f"✅ **{coint_stats['signal']}** - {coint_stats['trade']}")
+            
+            # NEW TAB 5 - Setup Scanner
+            with tab5:
+                setup_scanner_tab()
             
             st.divider()
             
